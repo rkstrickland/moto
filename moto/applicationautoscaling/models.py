@@ -1,11 +1,12 @@
 from __future__ import unicode_literals
 from moto.core import BaseBackend, BaseModel
 from moto.ecs import ecs_backends
-from .exceptions import AWSValidationException
+from .exceptions import AWSValidationException, AWSObjectNotFoundException
 from collections import OrderedDict
 from enum import Enum, unique
 import time
 import uuid
+import re
 
 
 @unique
@@ -65,6 +66,7 @@ class ApplicationAutoscalingBackend(BaseBackend):
         self.ecs_backend = ecs
         self.targets = OrderedDict()
         self.policies = {}
+        self.scheduled_actions = {}
 
     def reset(self):
         region = self.region
@@ -225,6 +227,127 @@ class ApplicationAutoscalingBackend(BaseBackend):
                 )
             )
 
+    def put_scheduled_action(
+        self,
+        scheduled_action_name,
+        service_namespace,
+        resource_id,
+        scalable_dimension,
+        schedule,
+        timezone=None,
+        start_time=None,
+        end_time=None,
+        scalable_target_action={},
+    ):
+        if resource_id not in [target.resource_id for target in self.targets]:
+            AWSObjectNotFoundException(
+                "No scalable target registered for service namespace: {}, resource ID: {}, scalable dimension: {}".format(
+                    service_namespace, resource_id, scalable_dimension
+                )
+            )
+        scheduled_action_key = FakeApplicationAutoscalingScheduledAction.formulate_key(
+            service_namespace, resource_id, scalable_dimension, scheduled_action_name
+        )
+        if scheduled_action_key in self.scheduled_actions:
+            old_scheduled_action = self.scheduled_actions[scheduled_action_name]
+            new_scalable_target_action = (
+                old_scheduled_action.scalalbe_target_action.copy()
+            )
+            new_scalable_target_action.update(scalable_target_action)
+            scheduled_action = FakeApplicationAutoscalingScheduledAction(
+                region_name=self.region,
+                scheduled_action_name=scheduled_action_name,
+                service_namespace=service_namespace,
+                resource_id=resource_id,
+                scalable_dimension=scalable_dimension,
+                schedule=schedule if schedule else old_scheduled_action.schedule,
+                timezone=timezone if timezone else old_scheduled_action.timezone,
+                start_time=start_time
+                if start_time
+                else old_scheduled_action.start_time,
+                end_time=end_time if end_time else old_scheduled_action.end_time,
+                scalable_target_action=new_scalable_target_action,
+            )
+        else:
+            scheduled_action = FakeApplicationAutoscalingScheduledAction(
+                region_name=self.region,
+                scheduled_action_name=scheduled_action_name,
+                service_namespace=service_namespace,
+                resource_id=resource_id,
+                scalable_dimension=scalable_dimension,
+                schedule=schedule,
+                timezone=timezone,
+                start_time=start_time,
+                end_time=end_time,
+                scalable_target_action=scalable_target_action,
+            )
+        self.scheduled_actions[scheduled_action_key] = scheduled_action
+        return scheduled_action
+
+    def describe_scheduled_actions(
+        self, service_namespace, **kwargs,
+    ):
+        scheduled_action_names = kwargs.get("scheduled_action_names")
+        resource_id = kwargs.get("resource_id")
+        scalable_dimension = kwargs.get("scalable_dimension")
+        max_results = kwargs.get("max_results") or 100
+        next_token = kwargs.get("next_token")
+        scheduled_actions = [
+            scheduled_action
+            for scheduled_action in self.scheduled_actions.values()
+            if scheduled_action.service_namespace == service_namespace
+        ]
+        if scheduled_action_names:
+            scheduled_actions = [
+                scheduled_action
+                for scheduled_action in scheduled_actions
+                if scheduled_action.scheduled_action_name in scheduled_action_names
+            ]
+        if resource_id:
+            scheduled_actions = [
+                scheduled_action
+                for scheduled_action in scheduled_actions
+                if scheduled_action.resource_id in resource_id
+            ]
+        if scalable_dimension:
+            scheduled_actions = [
+                scheduled_action
+                for scheduled_action in scheduled_actions
+                if scheduled_action.scalable_dimension in scalable_dimension
+            ]
+        starting_point = int(next_token) if next_token else 0
+        ending_point = starting_point + max_results
+        scheduled_actions_page = scheduled_actions[starting_point:ending_point]
+        new_next_token = (
+            str(ending_point) if ending_point < len(scheduled_actions) else None
+        )
+        return new_next_token, scheduled_actions_page
+
+    def delete_scheduled_action(
+        self, scheduled_action_name, service_namespace, resource_id, scalable_dimension,
+    ):
+        if resource_id not in [target.resource_id for target in self.targets]:
+            AWSObjectNotFoundException(
+                "No scalable target registered for service namespace: {}, resource ID: {}, scalable dimension: {}".format(
+                    service_namespace, resource_id, scalable_dimension
+                )
+            )
+        scheduled_action_key = FakeApplicationAutoscalingScheduledAction.formulate_key(
+            service_namespace, resource_id, scalable_dimension, scheduled_action_name
+        )
+        if scheduled_action_key in self.scheduled_actions:
+            del self.scheduled_actions[scheduled_action_key]
+            return {}
+        else:
+            raise AWSObjectNotFoundException(
+                "No scheduled action found for service namespace: {}, resource ID: {}, scalable dimension: {}, scheduled_action name: {}".format(
+                    service_namespace,
+                    resource_id,
+                    scalable_dimension,
+                    scheduled_action_name,
+                )
+            )
+
 
 def _target_params_are_valid(namespace, r_id, dimension):
     """Check whether namespace, resource_id and dimension are valid and consistent with each other."""
@@ -281,6 +404,30 @@ def _get_resource_type_from_resource_id(resource_id):
     else:
         resource_type = resource_split[0]
     return resource_type
+
+
+def _schedule_is_valid(schedule):
+    is_valid = False
+    schedule_expression = re.match("^(at|rate|cron)\((.*)\)$", schedule)
+    if schedule_expression:
+        schedule_type = schedule_expression.group(1)
+        schedule_value = schedule_expression.group(2)
+        if schedule_type == "cron":
+            cron = re.match("(*|(*/)?[0-9]+)\s+(*|(*/)?[0-9]+)\s+(*|\?|[0-9]+)\s+(())")
+        if schedule_type == "at":
+            try:
+                datetime.strptime(schedule_value, "%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                raise AWSValidationException("Invalid schedule at DateTime expression.")
+        if schedule_type == "rate":
+            rate = re.match("([0-9]+) ((minute|hour|day)s?)", schedule_value)
+            if rate:
+                is_valid = True
+
+    if not is_valid:
+        raise AWSValidationException(
+            "Schedule expressions must have the following syntax: rate(<number>\s?(minutes?|hours?|days?)), cron(<cron_expression>) or at(yyyy-MM-dd'T'HH:mm:ss)"
+        )
 
 
 class FakeScalableTarget(BaseModel):
@@ -347,6 +494,67 @@ class FakeApplicationAutoscalingPolicy(BaseModel):
     def formulate_key(service_namespace, resource_id, scalable_dimension, policy_name):
         return "{}\t{}\t{}\t{}".format(
             service_namespace, resource_id, scalable_dimension, policy_name
+        )
+
+
+class FakeApplicationAutoscalingScheduledAction(BaseModel):
+    def __init__(
+        self,
+        region_name,
+        scheduled_action_name,
+        service_namespace,
+        resource_id,
+        scalable_dimension,
+        schedule,
+        scalable_target_action,
+        timezone=None,
+        start_time=None,
+        end_time=None,
+    ):
+        self.region_name = region_name
+        self.scheduled_action_name = scheduled_action_name
+        self.service_namespace = service_namespace
+        self.resource_id = resource_id
+        self.scalable_dimension = scalable_dimension
+        self.schedule = schedule
+        has_required_keys = any(
+            set(scalable_target_action.keys()) & set(["MinCapacity", "MaxCapacity"])
+        )
+        extra_keys = list(
+            set(scalable_target_action.keys()) ^ set(["MinCapacity", "MaxCapacity"])
+        )
+        if not has_required_keys:
+            raise AWSValidationException(
+                "At least one of minimum capacity and maximum capacity should be provided."
+            )
+        if extra_keys:
+            raise AWSValidationException(
+                "Unknown parameter in ScalableTargetAction: {}, must be one of: \
+            MinCapacity, MaxCapacity".format(
+                    str(extra_keys)
+                )
+            )
+        self.scalable_target_action = scalable_target_action
+        self.timezone = timezone
+        self.start_time = start_time
+        self.end_time = end_time
+
+        self._guid = uuid.uuid4()
+        self.scheduled_action_arn = "arn:aws:autoscaling:{}:scheduledAction:{}:resource/{}/{}:scheduledActionName/{}".format(
+            region_name,
+            self._guid,
+            self.service_namespace,
+            self.resource_id,
+            self.scheduled_action_name,
+        )
+        self.creation_time = time.time()
+
+    @staticmethod
+    def formulate_key(
+        service_namespace, resource_id, scalable_dimension, scheduled_action_name
+    ):
+        return "{}\t{}\t{}\t{}".format(
+            service_namespace, resource_id, scalable_dimension, scheduled_action_name
         )
 
 

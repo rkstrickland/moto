@@ -7,3 +7,10 @@ class AWSValidationException(JsonRESTError):
         super(AWSValidationException, self).__init__(
             "ValidationException", message, **kwargs
         )
+
+
+class AWSObjectNotFoundException(JsonRESTError):
+    def __init__(self, message, **kwargs):
+        super(AWSObjectNotFoundException, self).__init__(
+            "ObjectNotFoundException", message, **kwargs
+        )

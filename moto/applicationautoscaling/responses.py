@@ -7,6 +7,7 @@ from .models import (
     ServiceNamespaceValueSet,
 )
 from .exceptions import AWSValidationException
+from dateutil.parser import parser as dtparse
 
 
 class ApplicationAutoScalingResponse(BaseResponse):
@@ -95,6 +96,48 @@ class ApplicationAutoScalingResponse(BaseResponse):
         )
         return json.dumps({})
 
+    def put_scheduled_action(self):
+        self.applicationautoscaling_backend.put_scheduled_action(
+            scheduled_action_name=self._get_param("ScheduledActionName"),
+            resource_id=self._get_param("ResourceId"),
+            service_namespace=self._get_param("ServiceNamespace"),
+            scalable_dimension=self._get_param("ScalableDimension"),
+            schedule=self._get_param("Schedule"),
+            timezone=self._get_param("Timezone"),
+            start_time=dtparse(self._get_param("StartTime")),
+            end_time=dtparse(self._get_param("EndTime")),
+            scalable_target_action=self._get_dict_param("ScalableTargetAction"),
+        )
+        return json.dumps({})
+
+    def describe_scheduled_actions(self):
+        (
+            next_token,
+            scheduled_action_page,
+        ) = self.applicationautoscaling_backend.describe_scheduled_actions(
+            service_namespace=self._get_param("ServiceNamespace"),
+            resource_id=self._get_param("ResourceId"),
+            scalable_dimension=self._get_param("ScalableDimension"),
+            max_results=self._get_param("MaxResults"),
+            next_token=self._get_param("NextToken"),
+        )
+        response_obj = {
+            "ScalingPolicies": [
+                _build_scheduled_action(p) for p in scheduled_action_page
+            ]
+        }
+        if next_token:
+            response_obj["NextToken"] = next_token
+        return json.dumps(response_obj)
+
+    def delete_scheduled_action(self):
+        self.applicationautoscaling_backend.delete_scheduled_action(
+            scheduled_action_name=self._get_param("ScheduledActionName"),
+            resource_id=self._get_param("ResourceId"),
+            service_namespace=self._get_param("ServiceNamespace"),
+            scalable_dimension=self._get_param("ScalableDimension"),
+        )
+
     def _validate_params(self):
         """Validate parameters.
         TODO Integrate this validation with the validation in models.py
@@ -156,4 +199,28 @@ def _build_policy(p):
         response[
             "TargetTrackingScalingPolicyConfiguration"
         ] = p.target_tracking_scaling_policy_configuration
+    return response
+
+
+def _build_scheduled_action(sa):
+    response = {
+        "ScheduledActionName": sa.scheduled_action_name,
+        "ScheduledActionARN": sa.scheduled_action_arn,
+        "ServiceNamespace": sa.servicce_namesepace,
+        "ResourceId": sa.resource_id,
+        "ScalableDimension": sa.scalable_dimension,
+        "Schedule": sa.schedule,
+        "CreationTime": sa.creation_time,
+        "ScalableTargetAction": {},
+    }
+    if sa.timezone:
+        response["Timezone"] = sa.timezone
+    if sa.start_time:
+        response["StartTime"] = sa.start_time
+    if sa.end_time:
+        response["EndTime"] = sa.end_time
+    if sa.scalable_target_action.get("min_capacity"):
+        response["MinCapacity"] = sa.scalable_target_action.get("min_capacity")
+    if sa.scalable_target_action.get("max_capacity"):
+        response["MaxCapacity"] = sa.scalable_target_action.get("max_capacity")
     return response
