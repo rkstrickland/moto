@@ -7,7 +7,8 @@ from enum import Enum, unique
 import time
 import uuid
 import re
-
+from crontab import CronSlices
+from datetime import datetime
 
 @unique
 class ResourceTypeExceptionValueSet(Enum):
@@ -248,6 +249,8 @@ class ApplicationAutoscalingBackend(BaseBackend):
         scheduled_action_key = FakeApplicationAutoscalingScheduledAction.formulate_key(
             service_namespace, resource_id, scalable_dimension, scheduled_action_name
         )
+        _ = _schedule_is_valid(schedule)
+        _ = _scalable_target_action_is_valid(scalable_target_action)
         if scheduled_action_key in self.scheduled_actions:
             old_scheduled_action = self.scheduled_actions[scheduled_action_name]
             new_scalable_target_action = (
@@ -406,6 +409,7 @@ def _get_resource_type_from_resource_id(resource_id):
     return resource_type
 
 
+# TODO: This validator catches the most glaring errors, but does not cover each and every validation edge case.
 def _schedule_is_valid(schedule):
     is_valid = False
     schedule_expression = re.match("^(at|rate|cron)\((.*)\)$", schedule)
@@ -413,12 +417,24 @@ def _schedule_is_valid(schedule):
         schedule_type = schedule_expression.group(1)
         schedule_value = schedule_expression.group(2)
         if schedule_type == "cron":
-            cron = re.match("(*|(*/)?[0-9]+)\s+(*|(*/)?[0-9]+)\s+(*|\?|[0-9]+)\s+(())")
+            cron = schedule_expression.split()
+            cron.replace("?", "*")
+            year_field = cron.pop(-1)
+            if not re.match("[0-9]+(-[0-9]+)", year_field):
+                is_valid=False
+            try:
+                CronSlices(cron)
+            except ValueError:
+                is_valid=False
+            if not is_valid:
+                raise AWSValidationException("Invalid cron expression.")
+            is_valid=True
         if schedule_type == "at":
             try:
                 datetime.strptime(schedule_value, "%Y-%m-%dT%H:%M:%S")
             except ValueError:
                 raise AWSValidationException("Invalid schedule at DateTime expression.")
+            is_valid=True
         if schedule_type == "rate":
             rate = re.match("([0-9]+) ((minute|hour|day)s?)", schedule_value)
             if rate:
@@ -428,6 +444,28 @@ def _schedule_is_valid(schedule):
         raise AWSValidationException(
             "Schedule expressions must have the following syntax: rate(<number>\s?(minutes?|hours?|days?)), cron(<cron_expression>) or at(yyyy-MM-dd'T'HH:mm:ss)"
         )
+    return is_valid
+
+
+def _scalable_target_action_is_valid(scalable_target_action):
+    has_required_keys = any(
+        set(scalable_target_action.keys()) & set(["MinCapacity", "MaxCapacity"])
+    )
+    extra_keys = list(
+        set(scalable_target_action.keys()) ^ set(["MinCapacity", "MaxCapacity"])
+    )
+    if not has_required_keys:
+        raise AWSValidationException(
+            "At least one of minimum capacity and maximum capacity should be provided."
+        )
+    if extra_keys:
+        raise AWSValidationException(
+            "Unknown parameter in ScalableTargetAction: {}, must be one of: \
+        MinCapacity, MaxCapacity".format(
+                str(extra_keys)
+            )
+        )
+    return True
 
 
 class FakeScalableTarget(BaseModel):
@@ -517,23 +555,6 @@ class FakeApplicationAutoscalingScheduledAction(BaseModel):
         self.resource_id = resource_id
         self.scalable_dimension = scalable_dimension
         self.schedule = schedule
-        has_required_keys = any(
-            set(scalable_target_action.keys()) & set(["MinCapacity", "MaxCapacity"])
-        )
-        extra_keys = list(
-            set(scalable_target_action.keys()) ^ set(["MinCapacity", "MaxCapacity"])
-        )
-        if not has_required_keys:
-            raise AWSValidationException(
-                "At least one of minimum capacity and maximum capacity should be provided."
-            )
-        if extra_keys:
-            raise AWSValidationException(
-                "Unknown parameter in ScalableTargetAction: {}, must be one of: \
-            MinCapacity, MaxCapacity".format(
-                    str(extra_keys)
-                )
-            )
         self.scalable_target_action = scalable_target_action
         self.timezone = timezone
         self.start_time = start_time
